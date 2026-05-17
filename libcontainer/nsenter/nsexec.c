@@ -642,19 +642,40 @@ void join_namespaces(char *nslist)
 	} while ((namespace = strtok_r(NULL, ",", &saveptr)) != NULL);
 
 	/*
-	 * The ordering in which we join namespaces is important. We should
-	 * always join the user namespace *first*. This is all guaranteed
-	 * from the container_linux.go side of this, so we're just going to
-	 * follow the order given to us.
+	 * Join order: net -> user -> rest.
+	 *
+	 * Under K8s + CNI the sandbox's net-ns is owned by the initial user-ns,
+	 * so we must join it before entering the sandbox user-ns (which would
+	 * drop CAP_SYS_ADMIN in the initial user-ns and make setns return EPERM).
 	 */
 
+	/* Pass 1: net namespace (must precede user namespace join) */
 	for (i = 0; i < num; i++) {
-		struct namespace_t ns = namespaces[i];
+		if (namespaces[i].ns != CLONE_NEWNET)
+			continue;
+		if (setns(namespaces[i].fd, namespaces[i].ns) < 0)
+			bail("failed to setns to %s", namespaces[i].path);
+		close(namespaces[i].fd);
+		namespaces[i].fd = -1;
+	}
 
-		if (setns(ns.fd, ns.ns) < 0)
-			bail("failed to setns to %s", ns.path);
+	/* Pass 2: user namespace */
+	for (i = 0; i < num; i++) {
+		if (namespaces[i].ns != CLONE_NEWUSER || namespaces[i].fd < 0)
+			continue;
+		if (setns(namespaces[i].fd, namespaces[i].ns) < 0)
+			bail("failed to setns to %s", namespaces[i].path);
+		close(namespaces[i].fd);
+		namespaces[i].fd = -1;
+	}
 
-		close(ns.fd);
+	/* Pass 3: remaining namespaces (ipc, uts, mnt, pid, etc.) */
+	for (i = 0; i < num; i++) {
+		if (namespaces[i].fd < 0)
+			continue;
+		if (setns(namespaces[i].fd, namespaces[i].ns) < 0)
+			bail("failed to setns to %s", namespaces[i].path);
+		close(namespaces[i].fd);
 	}
 
 	free(namespaces);
