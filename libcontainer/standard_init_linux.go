@@ -38,6 +38,18 @@ const (
 	mkdir
 	rootfsIDMap
 	overlay
+	sysfsMount
+	procMount
+)
+
+// mountPhase tells the parent helper how to resolve Rootfs in an opReq:
+// pre-pivot uses the host absolute path; post-pivot uses "/" because the
+// helper inherits the container's pivoted mnt-ns view.
+type mountPhase int
+
+const (
+	phasePrePivot mountPhase = iota
+	phasePostPivot
 )
 
 type opReq struct {
@@ -48,6 +60,9 @@ type opReq struct {
 	Op                opReqType `json:"type"`
 	Rootfs            string    `json:"rootfs"`
 	FsuidMapFailOnErr bool      `json:"fsuid_map_fail_on_err"`
+
+	// Phase: see mountPhase. Selects whether the helper uses Rootfs or "/".
+	Phase mountPhase `json:"phase"`
 
 	// bind
 	Mount configs.Mount `json:"mount"`

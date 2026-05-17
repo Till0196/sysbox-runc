@@ -1408,7 +1408,7 @@ func (c *linuxContainer) makeCriuRestoreMountpoints(m *configs.Mount) error {
 		// sysbox-runc: this is no longer the case; prepareBindDest() only checks the
 		// mount destination; if we need to check the mount source we need to create a
 		// function that explicitly does this.
-		if err := prepareBindDest(m, true, c.config, nil); err != nil {
+		if err := prepareBindDest(m, true, c.config, nil, phasePrePivot); err != nil {
 			return err
 		}
 	default:
@@ -2444,7 +2444,7 @@ func (c *linuxContainer) handleReqOp(childPid int, reqs []opReq) error {
 	op := reqs[0].Op
 
 	switch op {
-	case bind, chown, mkdir, overlay, rootfsIDMap, switchDockerDns:
+	case bind, chown, mkdir, overlay, rootfsIDMap, switchDockerDns, sysfsMount, procMount:
 		return c.handleOp(op, childPid, reqs)
 	default:
 		return newSystemError(fmt.Errorf("invalid opReq type %d", int(op)))
@@ -2494,6 +2494,15 @@ func (c *linuxContainer) handleOp(op opReqType, childPid int, reqs []opReq) erro
 		namespaces = append(namespaces,
 			fmt.Sprintf("mnt:/proc/%d/ns/mnt", childPid),
 			fmt.Sprintf("pid:/proc/%d/ns/pid", childPid),
+		)
+
+	case sysfsMount, procMount:
+		// Enter mnt+pid+net but not user-ns: keep initial user-ns privileges
+		// so the kernel allows the mount; net-ns gives the container view.
+		namespaces = append(namespaces,
+			fmt.Sprintf("mnt:/proc/%d/ns/mnt", childPid),
+			fmt.Sprintf("pid:/proc/%d/ns/pid", childPid),
+			fmt.Sprintf("net:/proc/%d/ns/net", childPid),
 		)
 
 	case switchDockerDns:

@@ -474,8 +474,12 @@ func (l *linuxRootfsInit) Init() error {
 		}
 
 	case bind:
-		// The mount requests assume that the process cwd is the rootfs directory
+		// Mount requests assume cwd is the rootfs. See mountPhase for how
+		// pre/post-pivot picks the base.
 		rootfs := l.reqs[0].Rootfs
+		if l.reqs[0].Phase == phasePostPivot {
+			rootfs = "/"
+		}
 		if err := unix.Chdir(rootfs); err != nil {
 			return newSystemErrorWithCausef(err, "chdir to rootfs %s", rootfs)
 		}
@@ -554,8 +558,11 @@ func (l *linuxRootfsInit) Init() error {
 		}
 
 	case overlay:
-		// The mount requests assume that the process cwd is the rootfs directory
+		// cwd-relative; see mountPhase.
 		rootfs := l.reqs[0].Rootfs
+		if l.reqs[0].Phase == phasePostPivot {
+			rootfs = "/"
+		}
 		if err := unix.Chdir(rootfs); err != nil {
 			return newSystemErrorWithCausef(err, "chdir to rootfs %s", rootfs)
 		}
@@ -578,8 +585,36 @@ func (l *linuxRootfsInit) Init() error {
 			}
 		}
 
+	case sysfsMount, procMount:
+		// Helper stayed in initial user-ns, so the kernel permits the mount
+		// that the level-2 container init could not perform.
+		rootfs := l.reqs[0].Rootfs
+		if l.reqs[0].Phase == phasePostPivot {
+			rootfs = "/"
+		}
+		if err := unix.Chdir(rootfs); err != nil {
+			return newSystemErrorWithCausef(err, "chdir to rootfs %s", rootfs)
+		}
+
+		os.Lstat("/proc")
+		if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+			return newSystemErrorWithCause(err, "re-mounting procfs for sysfs/proc helper")
+		}
+		defer unix.Unmount("/proc", unix.MNT_DETACH)
+
+		for _, req := range l.reqs {
+			m := &req.Mount
+			mountLabel := req.Label
+			if err := mountPropagate(m, ".", mountLabel); err != nil {
+				return newSystemErrorWithCausef(err, "mounting %s at %s", m.Device, m.Destination)
+			}
+		}
+
 	case chown:
 		rootfs := l.reqs[0].Rootfs
+		if l.reqs[0].Phase == phasePostPivot {
+			rootfs = "/"
+		}
 
 		for _, req := range l.reqs {
 			path, err := securejoin.SecureJoin(rootfs, req.Path)
@@ -597,6 +632,9 @@ func (l *linuxRootfsInit) Init() error {
 
 	case mkdir:
 		rootfs := l.reqs[0].Rootfs
+		if l.reqs[0].Phase == phasePostPivot {
+			rootfs = "/"
+		}
 
 		for _, req := range l.reqs {
 			path, err := securejoin.SecureJoin(rootfs, req.Path)

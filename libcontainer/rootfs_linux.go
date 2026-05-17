@@ -205,7 +205,7 @@ func mountCmd(cmd configs.Command) error {
 	return nil
 }
 
-func prepareBindDest(m *configs.Mount, absDestPath bool, config *configs.Config, pipe io.ReadWriter) (err error) {
+func prepareBindDest(m *configs.Mount, absDestPath bool, config *configs.Config, pipe io.ReadWriter, phase mountPhase) (err error) {
 	var base, dest string
 
 	// ensure that the destination of the bind mount is resolved of symlinks at mount time because
@@ -226,14 +226,14 @@ func prepareBindDest(m *configs.Mount, absDestPath bool, config *configs.Config,
 	// update the mount with the correct dest after symlinks are resolved.
 	m.Destination = dest
 
-	if err = createIfNotExists(dest, m.BindSrcInfo.IsDir, config, pipe); err != nil {
+	if err = createIfNotExists(dest, m.BindSrcInfo.IsDir, config, pipe, phase); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func mountCgroupV1(m *configs.Mount, enableCgroupns bool, config *configs.Config, pipe io.ReadWriter) error {
+func mountCgroupV1(m *configs.Mount, enableCgroupns bool, config *configs.Config, pipe io.ReadWriter, phase mountPhase) error {
 
 	binds, err := getCgroupMounts(m)
 	if err != nil {
@@ -255,7 +255,7 @@ func mountCgroupV1(m *configs.Mount, enableCgroupns bool, config *configs.Config
 		PropagationFlags: m.PropagationFlags,
 	}
 
-	if err := mountToRootfs(tmpfs, config, enableCgroupns, pipe); err != nil {
+	if err := mountToRootfs(tmpfs, config, enableCgroupns, pipe, phase); err != nil {
 		return err
 	}
 
@@ -268,7 +268,7 @@ func mountCgroupV1(m *configs.Mount, enableCgroupns bool, config *configs.Config
 				return err
 			}
 
-			if err := mkdirall(subsystemPath, 0755, config, pipe); err != nil {
+			if err := mkdirall(subsystemPath, 0755, config, pipe, phase); err != nil {
 				return err
 			}
 
@@ -290,7 +290,7 @@ func mountCgroupV1(m *configs.Mount, enableCgroupns bool, config *configs.Config
 				return err
 			}
 		} else {
-			if err := mountToRootfs(b, config, enableCgroupns, pipe); err != nil {
+			if err := mountToRootfs(b, config, enableCgroupns, pipe, phase); err != nil {
 				return err
 			}
 		}
@@ -312,7 +312,7 @@ func mountCgroupV1(m *configs.Mount, enableCgroupns bool, config *configs.Config
 	return nil
 }
 
-func mountCgroupV2(m *configs.Mount, enableCgroupns bool, config *configs.Config, pipe io.ReadWriter) error {
+func mountCgroupV2(m *configs.Mount, enableCgroupns bool, config *configs.Config, pipe io.ReadWriter, phase mountPhase) error {
 
 	// sysbox-runc: use relative path (as otherwise we may not have permission to mkdir)
 	cgroupPath, err := securejoin.SecureJoin(".", m.Destination)
@@ -320,7 +320,7 @@ func mountCgroupV2(m *configs.Mount, enableCgroupns bool, config *configs.Config
 		return err
 	}
 
-	if err := mkdirall(cgroupPath, 0755, config, pipe); err != nil {
+	if err := mkdirall(cgroupPath, 0755, config, pipe, phase); err != nil {
 		return err
 	}
 
@@ -384,7 +384,7 @@ func doTmpfsCopyUp(m *configs.Mount, rootfs, mountLabel string) (Err error) {
 // working directory (cwd). This avoids permission-denied problems on the Mkdirall call
 // when shiftfs is mounted on the cwd. The exact cause of the permission problem is not
 // clear and needs further investigation.
-func mkdirall(path string, mode os.FileMode, config *configs.Config, pipe io.ReadWriter) error {
+func mkdirall(path string, mode os.FileMode, config *configs.Config, pipe io.ReadWriter, phase mountPhase) error {
 
 	fd, err := syscall.Open(".", unix.O_PATH|unix.O_CLOEXEC|unix.O_DIRECTORY, 0)
 	if err != nil {
@@ -403,12 +403,13 @@ func mkdirall(path string, mode os.FileMode, config *configs.Config, pipe io.Rea
 		// parent sysbox-runc process to do this for us.
 
 		req := opReq{
-			Op:     mkdir,
-			Rootfs: config.Rootfs,
-			Path:   path,
-			Mode:   mode,
-			Uid:    config.UidMappings[0].HostID,
-			Gid:    config.GidMappings[0].HostID,
+			Op:        mkdir,
+			Rootfs:    config.Rootfs,
+			Path:      path,
+			Mode:      mode,
+			Uid:       config.UidMappings[0].HostID,
+			Gid:       config.GidMappings[0].HostID,
+			Phase:     phase,
 		}
 
 		if err := syncParentDoOp([]opReq{req}, pipe); err != nil {
@@ -423,7 +424,7 @@ func mkdirall(path string, mode os.FileMode, config *configs.Config, pipe io.Rea
 	return nil
 }
 
-func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool, pipe io.ReadWriter) error {
+func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool, pipe io.ReadWriter, phase mountPhase) error {
 
 	mountLabel := config.MountLabel
 
@@ -451,13 +452,31 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 		} else if fi.Mode()&os.ModeDir == 0 {
 			return fmt.Errorf("filesystem %q must be mounted on ordinary directory", m.Device)
 		}
-		if err := mkdirall(dest, 0755, config, pipe); err != nil {
+		if err := mkdirall(dest, 0755, config, pipe, phase); err != nil {
 			return fmt.Errorf("failed to created dir for %s mount: %v", m.Device, err)
 		}
-		// Selinux kernels do not support labeling of /proc or /sys
-		return mountPropagate(m, ".", "")
+		// sysbox-runc: a nested user-ns (e.g. containerd v2 shim) makes the
+		// kernel reject the sysfs/proc mount with EPERM. Delegate to the
+		// parent runc, which retains initial user-ns privileges.
+		opType := sysfsMount
+		if m.Device == "proc" {
+			opType = procMount
+		}
+		req := opReq{
+			Op:        opType,
+			Rootfs:    config.Rootfs,
+			Mount:     *m,
+			Label:     mountLabel,
+			Uid:       config.UidMappings[0].HostID,
+			Gid:       config.GidMappings[0].HostID,
+			Phase:     phase,
+		}
+		if err := syncParentDoOp([]opReq{req}, pipe); err != nil {
+			return newSystemErrorWithCause(err, "syncing with parent runc to perform sysfs/proc mount")
+		}
+		return nil
 	case "mqueue":
-		if err := mkdirall(dest, 0755, config, pipe); err != nil {
+		if err := mkdirall(dest, 0755, config, pipe, phase); err != nil {
 			return err
 		}
 		if err := mountPropagate(m, rootfs, ""); err != nil {
@@ -467,7 +486,7 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 	case "tmpfs":
 		stat, err := os.Stat(dest)
 		if err != nil {
-			if err := mkdirall(dest, 0755, config, pipe); err != nil {
+			if err := mkdirall(dest, 0755, config, pipe, phase); err != nil {
 				return err
 			}
 		}
@@ -493,22 +512,23 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 		return nil
 	case "cgroup":
 		if cgroups.IsCgroup2UnifiedMode() {
-			return mountCgroupV2(m, enableCgroupns, config, pipe)
+			return mountCgroupV2(m, enableCgroupns, config, pipe, phase)
 		}
-		return mountCgroupV1(m, enableCgroupns, config, pipe)
+		return mountCgroupV1(m, enableCgroupns, config, pipe, phase)
 	case "overlay":
 		// Overlay mounts may require access to paths that the container's init
 		// process may not have permissions to access. We ask the parent runc
 		// process to perform the mount from within the container's mount namespace.
-		if err := mkdirall(dest, 0755, config, pipe); err != nil {
+		if err := mkdirall(dest, 0755, config, pipe, phase); err != nil {
 			return err
 		}
 
 		req := opReq{
-			Op:     overlay,
-			Mount:  *m,
-			Label:  config.MountLabel,
-			Rootfs: config.Rootfs,
+			Op:        overlay,
+			Mount:     *m,
+			Label:     config.MountLabel,
+			Rootfs:    config.Rootfs,
+			Phase:     phase,
 		}
 
 		if err := syncParentDoOp([]opReq{req}, pipe); err != nil {
@@ -520,7 +540,7 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 		// any previous mounts can invalidate the next mount's destination.
 		// this can happen when a user specifies mounts within other mounts to cause breakouts or other
 		// evil stuff to try to escape the container's rootfs.
-		if err := mkdirall(dest, 0755, config, pipe); err != nil {
+		if err := mkdirall(dest, 0755, config, pipe, phase); err != nil {
 			return err
 		}
 		return mountPropagate(m, rootfs, mountLabel)
@@ -528,6 +548,12 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 }
 
 func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermountsOnly bool) error {
+
+	// doSysboxfsOvermountsOnly == phase 2 (post-pivot); see mountPhase.
+	phase := phasePrePivot
+	if doSysboxfsOvermountsOnly {
+		phase = phasePostPivot
+	}
 
 	// sysbox-runc: the sys container's init process is in a dedicated
 	// user-ns, so it may not have search permission to the bind mount
@@ -587,7 +613,7 @@ func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermoun
 			}
 		}
 
-		if err := prepareBindDest(m, false, config, pipe); err != nil {
+		if err := prepareBindDest(m, false, config, pipe, phase); err != nil {
 			return err
 		}
 
@@ -597,6 +623,7 @@ func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermoun
 			Label:             config.MountLabel,
 			Rootfs:            config.Rootfs,
 			FsuidMapFailOnErr: config.FsuidMapFailOnErr,
+			Phase:             phase,
 		}
 
 		mntReqs = append(mntReqs, req)
@@ -788,7 +815,7 @@ func createDeviceNode(node *devices.Device, bind bool, config *configs.Config, p
 	if err != nil {
 		return err
 	}
-	if err := mkdirall(filepath.Dir(dest), 0755, config, pipe); err != nil {
+	if err := mkdirall(filepath.Dir(dest), 0755, config, pipe, phasePrePivot); err != nil {
 		return err
 	}
 	if bind {
@@ -1027,14 +1054,14 @@ func chroot() error {
 }
 
 // createIfNotExists creates a file or a directory only if it does not already exist.
-func createIfNotExists(path string, isDir bool, config *configs.Config, pipe io.ReadWriter) error {
+func createIfNotExists(path string, isDir bool, config *configs.Config, pipe io.ReadWriter, phase mountPhase) error {
 
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
 			if isDir {
-				return mkdirall(path, 0755, config, pipe)
+				return mkdirall(path, 0755, config, pipe, phase)
 			}
-			if err := mkdirall(filepath.Dir(path), 0755, config, pipe); err != nil {
+			if err := mkdirall(filepath.Dir(path), 0755, config, pipe, phase); err != nil {
 				return err
 			}
 			f, err := os.OpenFile(path, os.O_CREATE, 0755)
@@ -1279,6 +1306,11 @@ func doRootfsIDMapping(config *configs.Config, pipe io.ReadWriter) error {
 // mounted (e.g., mounts under /proc/sys/). Otherwise such mounts are skipped.
 func doMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermountsOnly bool) error {
 
+	phase := phasePrePivot
+	if doSysboxfsOvermountsOnly {
+		phase = phasePostPivot
+	}
+
 	chownList := []string{}
 
 	// Do non-bind mounts
@@ -1291,7 +1323,7 @@ func doMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermountsOn
 		}
 
 		if m.Device != "bind" {
-			if err := mountToRootfs(m, config, true, pipe); err != nil {
+			if err := mountToRootfs(m, config, true, pipe, phase); err != nil {
 				return newSystemErrorWithCausef(err, "mounting %q to rootfs %q at %q; mount = %+v",
 					m.Source, config.Rootfs, m.Destination, m)
 			}
