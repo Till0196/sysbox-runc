@@ -19,7 +19,7 @@ import (
 // This test exercises the positive path: a userns container should still see
 // sysfs and proc mounted in its mount table after the change. The Docker-based
 // CI does not reproduce the nested user-ns scenario itself, so this is a
-// non-regression guard rather than a direct repro of issue #1006.
+// non-regression guard rather than a direct repro of the K8s scenario.
 func TestSysfsProcMountWithUserns(t *testing.T) {
 	if testing.Short() {
 		return
